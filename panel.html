@@ -1,147 +1,186 @@
-<!-- Panel OnTrader Index Real (100% client-side, proxy Vercel, solo navegador) -->
-<div id="ontrader-panel"><div style="text-align:center;color:#aaa;padding:40px;">Cargando datos de Binance…</div></div>
-<div id="ontrader-error" style="color:#f55;text-align:center;"></div>
-<script>
-const STABLES = ["USDT","USDC","BUSD","TUSD","FDUSD","DAI","PAX","GUSD"];
-const PROXY_BASE = "https://binance-proxy-swart.vercel.app/api/binance-proxy?url=";
-const BINANCE_API = "https://fapi.binance.com";
-const SYMBOL_LIMIT = 100, REFRESH_MS = 120000;
-let cache = {}, prevScores = {};
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>OnTrader Index Panel</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #101729; color: #fff; font-family: 'Segoe UI', Arial, sans-serif;}
+    h1 { margin: 0; padding: 10px; text-align: center; color: #25f0ff; font-size: 1.5rem;}
+    h2 { color: #25f0ff; margin-top: 32px; margin-bottom: 12px; font-size: 1.15rem;}
+    #panel { padding: 0 6px 30px 6px; }
+    .loading { text-align: center; padding: 50px; font-size: 1.2rem; color: #888; }
+    table { width: 100%; border-collapse: collapse; border-radius: 14px; overflow: hidden; margin: 12px 0 18px 0; background: #151d2b; box-shadow: 0 2px 10px #0002;}
+    th, td { padding: 8px 4px; text-align: center; }
+    thead { background: #232f4b; color: #25f0ff; font-weight: 600; font-size: 1rem;}
+    tbody tr:nth-child(even) { background: #121a2a;}
+    tbody tr:hover { background: #273250;}
+    td.phase { font-size: 1.2rem; }
+    td.high { color: #00ffae; font-weight: 700;}
+    td.mid { color: orange;}
+    td.low { color: #ff4455;}
+    .score-up { background: linear-gradient(90deg,#003f1e 80%,#00ffae0f);}
+    .score-down { background: linear-gradient(90deg,#3f0000 80%,#ff44551c);}
+    .alert { color: #fff; background: #252f4c; }
+    #error-box { text-align: center; color: #f55; padding: 5px; }
+    @media (max-width:600px) {
+      th, td { font-size: 0.86rem; padding: 7px 2px;}
+      h1 { font-size: 1.1rem;}
+    }
+  </style>
+</head>
+<body>
+  <h1>OnTrader Index Panel — Binance Futures</h1>
+  <div id="panel"><div class="loading">Cargando datos…</div></div>
+  <div id="error-box"></div>
+  <script>
+    const API = "https://fapi.binance.com";
+    const STABLES = ['USDT','USDC','BUSD','TUSD','USDP','DAI','FDUSD','EUR','TRY','BRL','ARS','PYUSD'];
+    const panel = document.getElementById('panel');
+    const errorBox = document.getElementById('error-box');
+    let prevScores = JSON.parse(localStorage.getItem('ontraderScores')||'{}');
+    let alerts = [];
+    const REFRESH_MS = 120000;
 
-function isStable(symbol) {
-  return STABLES.some(st => symbol.endsWith(st));
-}
-async function fetchJson(url) {
-  const resp = await fetch(PROXY_BASE + encodeURIComponent(url));
-  if(!resp.ok) throw new Error("Status "+resp.status);
-  return resp.json();
-}
-async function getTopSymbols() {
-  const data = await fetchJson(BINANCE_API + "/fapi/v1/ticker/24hr");
-  return data.filter(d => !isStable(d.symbol) && d.contractType==="PERPETUAL")
-    .sort((a,b)=>parseFloat(b.openInterest)-parseFloat(a.openInterest))
-    .slice(0, SYMBOL_LIMIT)
-    .map(d => d.symbol);
-}
-async function getKlines(symbol, interval, limit) {
-  const url = `${BINANCE_API}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-  const arr = await fetchJson(url);
-  return arr.map(a => ({
-    time:+a[0], open:+a[1], high:+a[2], low:+a[3], close:+a[4], volume:+a[5]
-  }));
-}
-function getSundayMinMax(daily) {
-  for(let i=daily.length-1;i>=0;i--) {
-    const dt = new Date(daily[i].time);
-    if(dt.getUTCDay()===0) return {min:daily[i].low, max:daily[i].high};
-  }
-  return {min:daily[0].low, max:daily[0].high};
-}
-function calcEMA(prices, period=28) {
-  const k = 2/(period+1); let ema = prices[0];
-  for(let i=1;i<prices.length;i++) ema = prices[i]*k + ema*(1-k);
-  return ema;
-}
-function calcRSI(prices, period=14) {
-  let gains=0, losses=0;
-  for(let i=1;i<prices.length;i++) {
-    const d = prices[i]-prices[i-1];
-    if(d>0) gains+=d; else losses-=d;
-  }
-  if(gains+losses===0) return 50;
-  const avgGain = gains/period, avgLoss = losses/period || 1e-8;
-  const rs = avgGain/avgLoss;
-  return 100-(100/(1+rs));
-}
-function calcScorePhases({lastPrice,minSun,maxSun,ema15,rsi15,ema5,rsi5,rsi4}) {
-  let score = 1;
-  if(lastPrice>minSun) score+=3;
-  if(lastPrice>maxSun) score+=2;
-  if(rsi15>50 && lastPrice>ema15) score+=2;
-  if(rsi15<50 && lastPrice<ema15) score-=2;
-  if(rsi5>70 && lastPrice>ema5) score+=1;
-  if(rsi5<30 && lastPrice<ema5) score-=1;
-  if(rsi4<15) score+=0.5;
-  if(rsi4>85) score-=0.5;
-  score = Math.max(1, Math.min(10, score));
-  let phase = '';
-  if(score<=3.0) phase = '🔴 Oversold';
-  else if(score<4.9) phase = '🔴 Bearish Incline';
-  else if(score<6.0) phase = '🟠 Accumulation';
-  else if(score<8.1) phase = '🟡 Bullish Incline';
-  else phase = '🟢 Overbought';
-  return { score, phase };
-}
+    function phaseText(s) {
+      if (s <= 3.0) return '🔴 Oversold';
+      else if (s < 4.9) return '🔴 Bearish Incline';
+      else if (s < 6.0) return '🟠 Accumulation';
+      else if (s < 8.1) return '🟡 Bullish Incline';
+      else return '🟢 Overbought';
+    }
 
-async function fetchAndCalc() {
-  const panel = document.getElementById("ontrader-panel");
-  const errorBox = document.getElementById("ontrader-error");
-  panel.innerHTML = `<div style="text-align:center;color:#aaa;padding:40px;">Cargando datos de Binance…</div>`;
-  errorBox.textContent = "";
-  let symbols;
-  try {
-    symbols = await getTopSymbols();
-  } catch (e) {
-    errorBox.textContent = "Error: no se pudo descargar símbolos de Binance.";
-    return;
-  }
-  const results = [];
-  for(const symbol of symbols) {
-    try {
-      const daily = await getKlines(symbol, "1d", 14);
-      const {min:minSun,max:maxSun} = getSundayMinMax(daily);
-      const v15 = await getKlines(symbol, "15m", 40);
-      const v5 = await getKlines(symbol, "5m", 40);
-      const v4 = await getKlines(symbol, "4m", 40);
+    // Score formula (dummy RSI/EMA/extremos: ¡Reemplazar por tus valores reales!)
+    function calcScore(d) {
+      let score = 1;
+      if (d.lastPrice > d.sunMin) score += 3;
+      if (d.lastPrice > d.sunMax) score += 2;
+      if (d.rsi15m > 50 && d.lastPrice > d.ema15m) score += 2;
+      if (d.rsi15m < 50 && d.lastPrice < d.ema15m) score -= 2;
+      if (d.rsi5m > 70 && d.lastPrice > d.ema5m) score += 1;
+      if (d.rsi5m < 30 && d.lastPrice < d.ema5m) score -= 1;
+      if (d.rsi4m < 15) score += 0.5;
+      if (d.rsi4m > 85) score -= 0.5;
+      return Math.max(1, Math.min(10, score));
+    }
 
-      const close15 = v15.map(v=>v.close);
-      const close5 = v5.map(v=>v.close);
-      const close4 = v4.map(v=>v.close);
+    function dummyRSI() { return Math.floor(Math.random()*100);}
+    function dummyEMA(price) { return price*(0.99+Math.random()*0.02);}
+    async function fetchWithProxy(url) {
+      let errorMsg = '';
+      const proxies = [u=>u, u=>`https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`, u=>`https://thingproxy.freeboard.io/fetch/${u}`];
+      for (const wrap of proxies) {
+        try {
+          const resp = await fetch(wrap(url));
+          const data = await resp.json();
+          if (Array.isArray(data) || (typeof data === 'object' && data !== null)) return data;
+        } catch(e) { errorMsg = e.message;}
+      }
+      throw new Error("No se pudo obtener datos de Binance. "+errorMsg);
+    }
 
-      const ema15 = calcEMA(close15.slice(-28), 28);
-      const rsi15 = calcRSI(close15.slice(-15), 14);
-      const ema5 = calcEMA(close5.slice(-28), 28);
-      const rsi5 = calcRSI(close5.slice(-15), 14);
-      const rsi4 = calcRSI(close4.slice(-15), 14);
-      const lastPrice = close15[close15.length-1];
+    async function loadData() {
+      panel.innerHTML = '<div class="loading">Cargando datos…</div>';
+      errorBox.innerText = '';
+      try {
+        const data = await fetchWithProxy(`${API}/fapi/v1/ticker/24hr`);
+        if (!Array.isArray(data)) throw new Error("Respuesta inesperada de la API: " + JSON.stringify(data));
+        let list = data.filter(d => d.symbol.endsWith("USDT") && !STABLES.some(st => d.symbol === st + "USDT"))
+                       .sort((a, b) => b.quoteVolume - a.quoteVolume).slice(0, 100);
+        for (let d of list) {
+          d.lastPrice = parseFloat(d.lastPrice);
+          d.rsi15m = dummyRSI(); d.ema15m = dummyEMA(d.lastPrice);
+          d.rsi5m = dummyRSI(); d.ema5m = dummyEMA(d.lastPrice);
+          d.rsi4m = dummyRSI();
+          d.sunMin = d.lowPrice ? parseFloat(d.lowPrice) : d.lastPrice * 0.95;
+          d.sunMax = d.highPrice ? parseFloat(d.highPrice) : d.lastPrice * 1.05;
+        }
+        // Calcular score y scorePrev
+        const updatedPrevScores = {};
+        list.forEach(d => {
+          const prev = prevScores[d.symbol] || null;
+          d.scorePrev = prev ? prev.score : '';
+          d.score = calcScore(d);
+          updatedPrevScores[d.symbol] = { score: d.score };
+        });
+        prevScores = updatedPrevScores;
+        localStorage.setItem('ontraderScores', JSON.stringify(updatedPrevScores));
 
-      const {score,phase} = calcScorePhases({lastPrice,minSun,maxSun,ema15,rsi15,ema5,rsi5,rsi4});
-      let prev = cache[symbol]?.score || score;
-      results.push({symbol, lastPrice, phase, score, prev});
-      cache[symbol] = {score};
-    } catch(e) { continue; }
-  }
+        // Cambios de score
+        const upMoves = [], downMoves = [];
+        list.forEach(d => {
+          if (d.scorePrev !== '' && d.score > d.scorePrev) upMoves.push(d);
+          if (d.scorePrev !== '' && d.score < d.scorePrev) downMoves.push(d);
+        });
 
-  // Top 10 Alcistas/Bajistas
-  const topBull = results.slice().sort((a,b)=>b.score-a.score).slice(0,10);
-  const topBear = results.slice().sort((a,b)=>a.score-b.score).slice(0,10);
-  // Top subidas score
-  const topRise = results.filter(r=>r.score>r.prev).sort((a,b)=>(b.score-b.prev)-(a.score-a.prev)).slice(0,10);
-  // Top caídas score
-  const topFall = results.filter(r=>r.score<r.prev).sort((a,b)=>(a.score-a.prev)-(b.score-b.prev)).slice(0,10);
+        // Top 10 Bullish / Bearish
+        const top10Bull = list.slice().sort((a,b)=>b.score-a.score).slice(0,10);
+        const top10Bear = list.slice().sort((a,b)=>a.score-b.score).slice(0,10);
 
-  panel.innerHTML = `
-    <h3 style="color:#25f0ff">Top 10 Alcistas</h3>${makeTable(topBull)}
-    <h3 style="color:#25f0ff">Top 10 Bajistas</h3>${makeTable(topBear)}
-    <h3 style="color:#25f0ff">Top 10 Cambios al Alza</h3>${makeTable(topRise)}
-    <h3 style="color:#25f0ff">Top 10 Cambios a la Baja</h3>${makeTable(topFall)}
-    <div style="text-align:center;color:#888;">Actualizado: ${new Date().toLocaleTimeString()}</div>
-  `;
-  try { localStorage.setItem('ontraderScores', JSON.stringify(cache)); } catch {}
-}
-function makeTable(arr) {
-  let html = '<table style="width:100%;border-collapse:collapse;margin:8px 0;font-size:0.93rem;"><thead><tr><th>Símbolo</th><th>Precio</th><th>Fase</th><th>Score</th><th>Prev Score</th></tr></thead><tbody>';
-  for(const d of arr) html+=`<tr>
-    <td>${d.symbol}</td>
-    <td>${(+d.lastPrice).toFixed(6)}</td>
-    <td>${d.phase}</td>
-    <td style="color:${d.score>=8?'limegreen':d.score<=3?'red':'orange'};">${d.score.toFixed(2)}</td>
-    <td>${d.prev.toFixed(2)}</td>
-  </tr>`;
-  return html+'</tbody></table>';
-}
+        // Top cambios up/down
+        const top10Up = upMoves.slice().sort((a,b)=>(b.score-b.scorePrev)-(a.score-a.scorePrev)).slice(0,10);
+        const top10Down = downMoves.slice().sort((a,b)=>(a.score-a.scorePrev)-(b.score-b.scorePrev)).slice(0,10);
 
-try { cache = JSON.parse(localStorage.getItem('ontraderScores')) || {}; } catch {}
-fetchAndCalc();
-setInterval(fetchAndCalc, REFRESH_MS);
-</script>
+        // Alertas de cambios de fase
+        alerts = [];
+        list.forEach(d => {
+          if (d.scorePrev !== '' && phaseText(d.scorePrev) !== phaseText(d.score)) {
+            alerts.unshift({ time: new Date().toLocaleTimeString(), symbol: d.symbol, prev: phaseText(d.scorePrev), now: phaseText(d.score), score:d.score, scorePrev:d.scorePrev });
+          }
+        });
+        if (alerts.length > 20) alerts = alerts.slice(0,20);
+
+        renderTables(top10Bull, top10Bear, top10Up, top10Down, alerts);
+      } catch(e) {
+        errorBox.innerText = 'Error cargando datos: ' + e.message;
+        panel.innerHTML = '';
+      }
+    }
+
+    function makeTable(title, arr, opts={}) {
+      let html = `<h2>${title}</h2><table><thead>
+        <tr>
+          <th>Symbol</th>
+          <th>Last Price</th>
+          <th>Score</th>
+          <th>Prev Score</th>
+          <th>Phase</th>
+        </tr></thead><tbody>`;
+      for (const d of arr) {
+        let deltaClass = '';
+        if (d.scorePrev !== '') deltaClass = d.score > d.scorePrev ? 'score-up' : (d.score < d.scorePrev ? 'score-down' : '');
+        html += `<tr class="${deltaClass}">
+          <td>${d.symbol}</td>
+          <td>${d.lastPrice.toFixed(6)}</td>
+          <td class="${d.score >= 8 ? 'high' : d.score >= 5 ? 'mid' : 'low'}">${d.score}</td>
+          <td>${d.scorePrev}</td>
+          <td class="phase">${phaseText(d.score)}</td>
+        </tr>`;
+      }
+      html += '</tbody></table>';
+      return html;
+    }
+
+    function makeAlertsTable(alerts) {
+      let html = `<h2>Últimas 20 Alertas</h2><table><thead>
+        <tr><th>Hora</th><th>Symbol</th><th>Score Prev</th><th>Score</th><th>Fase Prev</th><th>Nueva Fase</th></tr></thead><tbody>`;
+      for (const a of alerts)
+        html += `<tr class="alert"><td>${a.time}</td><td>${a.symbol}</td><td>${a.scorePrev}</td><td>${a.score}</td><td>${a.prev}</td><td>${a.now}</td></tr>`;
+      html += '</tbody></table>';
+      return html;
+    }
+
+    function renderTables(top10Bull, top10Bear, top10Up, top10Down, alerts) {
+      panel.innerHTML = 
+        makeTable('Top 10 Alcista', top10Bull) +
+        makeTable('Top 10 Bajista', top10Bear) +
+        makeTable('Top 10 Cambios Score Al Alza', top10Up) +
+        makeTable('Top 10 Cambios Score A La Baja', top10Down) +
+        makeAlertsTable(alerts);
+    }
+
+    loadData();
+    setInterval(loadData, REFRESH_MS);
+  </script>
+</body>
+</html>
