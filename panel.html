@@ -2,68 +2,181 @@
 <html lang="es">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>OnTrader Index Panel - 5m</title>
+  <title>OnTrader Real Futures Index</title>
   <style>
-    body { background: #101729; color: #fff; font-family: sans-serif; margin:0; }
-    h1 { color: #25f0ff; text-align: center; margin-top:16px; }
-    #panel { padding: 10px; }
-    .loading { text-align:center; padding:40px; color:#888; }
-    table { width: 100%; border-collapse: collapse; margin-bottom: 18px;}
-    th, td { border: 1px solid #333; padding: 5px 7px; text-align: center; }
-    th { background: #16213c; color: #25f0ff; }
-    .high { color: #45f877; font-weight: bold; }
-    .low { color: #ff4444; font-weight: bold; }
+    html, body { margin:0; padding:0; background: #101729; color: #fff; font-family: sans-serif; height: 100%; }
+    h1 { text-align: center; color: #25f0ff; }
+    #panel { padding: 0 10px; overflow-y: auto; }
+    .loading { text-align: center; padding: 40px; color: #aaa; }
+    table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 0.93rem;}
+    th, td { border: 1px solid #333; padding: 5px; text-align: center;}
+    thead { background: #1f2a44; color: #25f0ff; }
+    .high { color: limegreen; }
+    .low { color: red; }
     .mid { color: orange; }
-    .bullish { background: rgba(0,255,0,0.11);}
-    .bearish { background: rgba(255,0,0,0.09);}
-    #error { color: #ff6f6f; text-align: center; font-weight: bold; }
+    #error-box { color: #f55; text-align: center; margin: 8px 0;}
   </style>
 </head>
 <body>
-  <h1>OnTrader Index Panel <span style="font-size:0.6em;">(5m)</span></h1>
-  <div id="panel"><div class="loading">Cargando datos…</div></div>
-  <div id="error"></div>
+<h1>OnTrader Real Futures Index</h1>
+<div id="panel"><div class="loading">Cargando datos reales…</div></div>
+<div id="error-box"></div>
 <script>
-const ENDPOINT = "https://binance-proxy-ihaub8pjl-ontraders-projects.vercel.app/api/binance";
-function makeTable(rows, header=["Símbolo","Últ. Precio","Score","Fase"]) {
-  let html = `<table><thead><tr>${header.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>`;
-  for(const row of rows) {
-    const cls = row.score >= 8 ? 'high' : row.score <= 3 ? 'low' : 'mid';
-    html += `<tr class="${row.phase.includes('Bullish') ? 'bullish': row.phase.includes('Bearish') ? 'bearish':''}">
-      <td>${row.symbol}</td>
-      <td>${row.lastPrice}</td>
-      <td class="${cls}">${row.score.toFixed(2)}</td>
-      <td>${row.phase}</td>
-    </tr>`;
-  }
-  return html+"</tbody></table>";
+const STABLES = ["USDT","USDC","BUSD","TUSD","FDUSD","DAI","PAX","GUSD"];
+const BASE_URL = "https://fapi.binance.com";
+const SYMBOL_LIMIT = 100;
+const REFRESH_MS = 120000; // 2 min
+
+let cache = {}, prevScores = {};
+
+function isStable(symbol) {
+  return STABLES.some(st => symbol.endsWith(st));
 }
-async function main() {
-  document.getElementById('panel').innerHTML = '<div class="loading">Cargando ranking…</div>';
-  document.getElementById('error').textContent = '';
+
+function calcEMA(prices, period=28) {
+  const k = 2/(period+1);
+  let ema = prices[0];
+  for(let i=1;i<prices.length;i++) ema = prices[i]*k + ema*(1-k);
+  return ema;
+}
+function calcRSI(prices, period=14) {
+  let gains=0, losses=0;
+  for(let i=1;i<prices.length;i++) {
+    const d = prices[i]-prices[i-1];
+    if(d>0) gains+=d; else losses-=d;
+  }
+  if (gains + losses === 0) return 50;
+  const avgGain = gains/period, avgLoss = losses/period || 1e-8;
+  const rs = avgGain/avgLoss;
+  return 100-(100/(1+rs));
+}
+
+async function fetchJson(url) {
+  const r = await fetch(url);
+  if(!r.ok) throw new Error("Status "+r.status);
+  return r.json();
+}
+
+async function getTopSymbols() {
+  const data = await fetchJson(BASE_URL + "/fapi/v1/ticker/24hr");
+  return data.filter(d => !isStable(d.symbol) && d.contractType==="PERPETUAL")
+    .sort((a,b)=>parseFloat(b.openInterest)-parseFloat(a.openInterest))
+    .slice(0, SYMBOL_LIMIT)
+    .map(d => d.symbol);
+}
+async function getKlines(symbol, interval, limit) {
+  const url = `${BASE_URL}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const arr = await fetchJson(url);
+  return arr.map(a => ({
+    time:+a[0], open:+a[1], high:+a[2], low:+a[3], close:+a[4], volume:+a[5]
+  }));
+}
+function getSundayMinMax(daily) {
+  for(let i=daily.length-1;i>=0;i--) {
+    const dt = new Date(daily[i].time);
+    if(dt.getUTCDay()===0) return {min:daily[i].low, max:daily[i].high};
+  }
+  return {min:daily[0].low, max:daily[0].high};
+}
+
+async function fetchAndCalc() {
+  panel.innerHTML = `<div class="loading">Cargando datos reales…</div>`;
+  errorBox.textContent = '';
+  let symbols;
   try {
-    let res = await fetch(ENDPOINT);
-    let proxyResp = await res.json();
-    if (!proxyResp.success || !Array.isArray(proxyResp.data)) {
-      throw new Error(proxyResp.error || "Formato de respuesta del proxy no válido");
-    }
-    let results = proxyResp.data;
-    // Rankings
-    const topBullish = results.slice().sort((a,b)=>b.score-a.score).slice(0,10);
-    const topBearish = results.slice().sort((a,b)=>a.score-b.score).slice(0,10);
-    // Renderiza todo
-    document.getElementById('panel').innerHTML =
-      `<h3>Top 10 Bullish</h3>${makeTable(topBullish)}` +
-      `<h3>Top 10 Bearish</h3>${makeTable(topBearish)}`;
-  } catch(e) {
-    document.getElementById('panel').innerHTML = '';
-    document.getElementById('error').textContent = 'Error cargando datos: ' + (e.message||e);
-    console.error("ERROR GLOBAL:", e);
+    symbols = await getTopSymbols();
+  } catch (e) {
+    errorBox.textContent = 'Error: no se pudo descargar símbolos de Binance.';
+    return;
   }
+  const results = [];
+  for(const symbol of symbols) {
+    try {
+      // Velas diarias
+      const daily = await getKlines(symbol, "1d", 14);
+      const {min: minSun, max: maxSun} = getSundayMinMax(daily);
+      // Velas 15m, 5m, 4m
+      const v15 = await getKlines(symbol, "15m", 40);
+      const v5 = await getKlines(symbol, "5m", 40);
+      const v4 = await getKlines(symbol, "4m", 40);
+
+      const close15 = v15.map(v=>v.close);
+      const close5 = v5.map(v=>v.close);
+      const close4 = v4.map(v=>v.close);
+
+      const ema15 = calcEMA(close15.slice(-28), 28);
+      const rsi15 = calcRSI(close15.slice(-15), 14);
+
+      const ema5 = calcEMA(close5.slice(-28), 28);
+      const rsi5 = calcRSI(close5.slice(-15), 14);
+
+      const rsi4 = calcRSI(close4.slice(-15), 14);
+
+      const lastPrice = close15[close15.length-1];
+
+      let score = 1;
+      if(lastPrice>minSun) score+=3;
+      if(lastPrice>maxSun) score+=2;
+      if(rsi15>50 && lastPrice>ema15) score+=2;
+      if(rsi15<50 && lastPrice<ema15) score-=2;
+      if(rsi5>70 && lastPrice>ema5) score+=1;
+      if(rsi5<30 && lastPrice<ema5) score-=1;
+      if(rsi4<15) score+=0.5;
+      if(rsi4>85) score-=0.5;
+      score = Math.max(1, Math.min(10, score));
+
+      let phase = '';
+      if(score<=3.0) phase = '🔴 Oversold';
+      else if(score<4.9) phase = '🔴 Bearish Incline';
+      else if(score<6.0) phase = '🟠 Accumulation';
+      else if(score<8.1) phase = '🟡 Bullish Incline';
+      else phase = '🟢 Overbought';
+
+      let prev = cache[symbol]?.score || score;
+      results.push({symbol, lastPrice, phase, score, prev});
+      cache[symbol] = {score}; // guardar para score previo
+    } catch(e) {
+      continue;
+    }
+  }
+
+  // Top 10 Alcistas
+  const topBull = results.slice().sort((a,b)=>b.score-a.score).slice(0,10);
+  // Top 10 Bajistas
+  const topBear = results.slice().sort((a,b)=>a.score-b.score).slice(0,10);
+  // Top subidas score
+  const topRise = results.filter(r=>r.score>r.prev).sort((a,b)=>(b.score-b.prev)-(a.score-a.prev)).slice(0,10);
+  // Top caídas score
+  const topFall = results.filter(r=>r.score<r.prev).sort((a,b)=>(a.score-a.prev)-(b.score-b.prev)).slice(0,10);
+
+  panel.innerHTML = `
+    <h2>Top 10 Alcistas</h2>${makeTable(topBull)}
+    <h2>Top 10 Bajistas</h2>${makeTable(topBear)}
+    <h2>Top 10 Cambios al Alza</h2>${makeTable(topRise)}
+    <h2>Top 10 Cambios a la Baja</h2>${makeTable(topFall)}
+    <div class="loading">Actualizado: ${new Date().toLocaleTimeString()}</div>
+  `;
+  // Guardar para la próxima sesión
+  localStorage.setItem('ontraderScores', JSON.stringify(cache));
 }
-main();
-setInterval(main, 120000);
+
+function makeTable(arr) {
+  let html = '<table><thead><tr><th>Símbolo</th><th>Precio</th><th>Fase</th><th>Score</th><th>Prev Score</th></tr></thead><tbody>';
+  for(const d of arr) html+=`<tr>
+    <td>${d.symbol}</td>
+    <td>${(+d.lastPrice).toFixed(6)}</td>
+    <td>${d.phase}</td>
+    <td class="${d.score>=8?'high':d.score<=3?'low':'mid'}">${d.score.toFixed(2)}</td>
+    <td>${d.prev.toFixed(2)}</td>
+  </tr>`;
+  return html+'</tbody></table>';
+}
+
+window.onload = ()=>{
+  try { cache = JSON.parse(localStorage.getItem('ontraderScores')) || {}; } catch {}
+  fetchAndCalc();
+  setInterval(fetchAndCalc, REFRESH_MS);
+};
 </script>
 </body>
 </html>
