@@ -1,104 +1,95 @@
-// api/binance.js
-const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
+// binance.js (ESM - usa export/import)
+// Soporta Vercel proxy: https://binance-proxy-swart.vercel.app/api/binance-proxy?url=URL_AQUI
+// y filtra los datos de Futuros, excluye stablecoins
 
-module.exports = async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  try {
-    // 1. Petición principal a Binance
-    const tickerResp = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
-    const text = await tickerResp.text();
+const STABLES = ["USDT", "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "PAX", "GUSD"];
+const SYMBOL_LIMIT = 100;
 
-    // 2. Si la respuesta es vacía
-    if (!text || text.length < 2) {
-      return res.status(502).json({
-        success: false,
-        error: "Binance empty response",
-        binance_body: text
-      });
-    }
+// Cambia aquí tu proxy base si lo deseas
+const PROXY_BASE = "https://binance-proxy-swart.vercel.app/api/binance-proxy?url=";
+const BINANCE_API = "https://fapi.binance.com";
 
-    // 3. Si la respuesta NO es un JSON array
-    if (text[0] !== '[') {
-      // Prueba si es JSON de error (objeto)
-      try {
-        const maybeObj = JSON.parse(text);
-        return res.status(502).json({
-          success: false,
-          error: "Binance returned JSON, but not an array",
-          binance_body: maybeObj
-        });
-      } catch {
-        // Es HTML, string raro o error 5xx
-        return res.status(502).json({
-          success: false,
-          error: "Binance did not return JSON array",
-          binance_body: text
-        });
-      }
-    }
+function isStable(symbol) {
+  return STABLES.some(st => symbol.endsWith(st));
+}
 
-    // 4. Parseo seguro (ya es array)
-    let tickers;
-    try {
-      tickers = JSON.parse(text);
-    } catch (e) {
-      return res.status(502).json({
-        success: false,
-        error: "Binance returned invalid JSON (array expected)",
-        binance_body: text,
-        parseError: e.message
-      });
-    }
-    if (!Array.isArray(tickers)) {
-      return res.status(502).json({
-        success: false,
-        error: "Binance did not return an array (after parse)",
-        binance_body: tickers
-      });
-    }
+export async function fetchJson(url) {
+  // Aplica proxy a la url completa
+  const resp = await fetch(PROXY_BASE + encodeURIComponent(url));
+  if (!resp.ok) throw new Error("Status " + resp.status);
+  return resp.json();
+}
 
-    // 5. Filtro robusto de stablecoins y que tengan campos requeridos
-    const stables = ['USDT', 'BUSD', 'TUSD', 'USDC', 'DAI', 'USDP', 'GUSD', 'USDN'];
-    const isStable = sym => stables.some(st => sym === st || sym.endsWith(st));
-    let filtered = tickers.filter(t =>
-      t.symbol &&
-      typeof t.symbol === "string" &&
-      t.symbol.endsWith('USDT') &&
-      !isStable(t.symbol.replace('USDT','')) // Ej: BTCUSDT -> BTC
-    );
+export async function getTopSymbols() {
+  // Solo contratos perpetuos y mayor open interest, sin stablecoins
+  const data = await fetchJson(BINANCE_API + "/fapi/v1/ticker/24hr");
+  return data.filter(d => !isStable(d.symbol) && d.contractType === "PERPETUAL")
+    .sort((a, b) => parseFloat(b.openInterest) - parseFloat(a.openInterest))
+    .slice(0, SYMBOL_LIMIT)
+    .map(d => d.symbol);
+}
 
-    // Si se vacía, alerta
-    if (!filtered.length) {
-      return res.status(502).json({
-        success: false,
-        error: "No USDT pairs found after filtering",
-        tickers_count: tickers.length,
-        sample: tickers.slice(0, 3)
-      });
-    }
+export async function getKlines(symbol, interval, limit) {
+  const url = `${BINANCE_API}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const arr = await fetchJson(url);
+  return arr.map(a => ({
+    time: +a[0],
+    open: +a[1],
+    high: +a[2],
+    low: +a[3],
+    close: +a[4],
+    volume: +a[5]
+  }));
+}
 
-    // 6. Ordena y deja top 50
-    filtered = filtered
-      .sort((a, b) => parseFloat(b.quoteVolume || 0) - parseFloat(a.quoteVolume || 0))
-      .slice(0, 50)
-      .map(t => ({
-        symbol: t.symbol,
-        lastPrice: t.lastPrice,
-        priceChangePercent: t.priceChangePercent,
-        quoteVolume: t.quoteVolume
-      }));
-
-    // 7. Respuesta final
-    res.status(200).json({ success: true, data: filtered });
-
-  } catch (e) {
-    // Error JS/fetch/timeout
-    res.status(500).json({
-      success: false,
-      error: e.message,
-      stack: e.stack
-    });
+export function getSundayMinMax(daily) {
+  for (let i = daily.length - 1; i >= 0; i--) {
+    const dt = new Date(daily[i].time);
+    if (dt.getUTCDay() === 0) return { min: daily[i].low, max: daily[i].high };
   }
-};
+  // Si no hay domingo, retorna el último día disponible
+  return { min: daily[0].low, max: daily[0].high };
+}
+
+export function calcEMA(prices, period = 28) {
+  const k = 2 / (period + 1);
+  let ema = prices[0];
+  for (let i = 1; i < prices.length; i++) ema = prices[i] * k + ema * (1 - k);
+  return ema;
+}
+
+export function calcRSI(prices, period = 14) {
+  let gains = 0, losses = 0;
+  for (let i = 1; i < prices.length; i++) {
+    const d = prices[i] - prices[i - 1];
+    if (d > 0) gains += d;
+    else losses -= d;
+  }
+  if (gains + losses === 0) return 50;
+  const avgGain = gains / period, avgLoss = losses / period || 1e-8;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
+}
+
+// Score y fase - misma lógica que tienes, se puede modularizar más si quieres
+export function calcScorePhases({ lastPrice, minSun, maxSun, ema15, rsi15, ema5, rsi5, rsi4 }) {
+  let score = 1;
+  if (lastPrice > minSun) score += 3;
+  if (lastPrice > maxSun) score += 2;
+  if (rsi15 > 50 && lastPrice > ema15) score += 2;
+  if (rsi15 < 50 && lastPrice < ema15) score -= 2;
+  if (rsi5 > 70 && lastPrice > ema5) score += 1;
+  if (rsi5 < 30 && lastPrice < ema5) score -= 1;
+  if (rsi4 < 15) score += 0.5;
+  if (rsi4 > 85) score -= 0.5;
+  score = Math.max(1, Math.min(10, score));
+
+  let phase = '';
+  if (score <= 3.0) phase = '🔴 Oversold';
+  else if (score < 4.9) phase = '🔴 Bearish Incline';
+  else if (score < 6.0) phase = '🟠 Accumulation';
+  else if (score < 8.1) phase = '🟡 Bullish Incline';
+  else phase = '🟢 Overbought';
+
+  return { score, phase };
+}
